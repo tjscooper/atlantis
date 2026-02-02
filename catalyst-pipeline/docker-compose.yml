@@ -1,0 +1,424 @@
+version: '3.9'
+
+# =============================================================================
+# DEVELOPMENT PROFILE — TWO-MACHINE SPLIT
+# =============================================================================
+# This pipeline is designed to run across two machines during development.
+# The split is driven by what each machine is actually good at.
+#
+# ALIENWARE AURORA R7 (runs the GPU workload + data layer)
+#   - db (PostgreSQL)
+#   - redis
+#   - mlflow
+#   - data-ingestion-worker
+#   - ml-training-worker          <-- only service that needs the 1080 Ti
+#   - prometheus / grafana
+#
+# ROG ALLY X (runs everything that doesn't need a GPU)
+#   - db, redis, mlflow           (connect to R7 via network — see .env)
+#   - data-ingestion-worker       (I/O bound, runs fine on Z1 Extreme)
+#   - prediction-worker           (CPU-bound batch inference, no GPU needed)
+#   - api                         (async I/O, trivial load)
+#   - frontend                    (static files, zero compute)
+#
+# To run the Ally X subset against a remote R7 data layer, copy .env and
+# override DATABASE_URL, REDIS_URL, and MLFLOW_TRACKING_URI to point at
+# the R7's IPs. Then start only the services you need:
+#
+#   docker compose up db redis mlflow                         # on R7
+#   docker compose up prediction-worker api frontend          # on Ally X
+#
+# For single-machine development (everything local), just run:
+#   docker compose up
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# NAMED VOLUMES
+# Persistent storage that survives container restarts. Each volume is scoped
+# to a single responsibility so you can back up, migrate, or nuke them
+# independently.
+# ---------------------------------------------------------------------------
+volumes:
+  postgres_data:       # All structured materials data + predictions + run metadata
+  redis_data:          # Persisted job queue state (survives Redis restarts)
+  mlflow_artifacts:    # Trained model weights, plots, metrics logged by MLflow
+  mlflow_db:           # SQLite database backing MLflow's tracking server
+  raw_data_cache:      # Downloaded/ingested raw data from Materials Project, OC20, etc.
+  model_cache:         # Pretrained model weights pulled from HuggingFace or similar
+
+# ---------------------------------------------------------------------------
+# NAMED NETWORKS
+# Isolate traffic between layers of the system. The frontend never talks
+# directly to the database. The ML workers never talk to the web UI.
+# ---------------------------------------------------------------------------
+networks:
+  frontend_net:        # API <-> React UI
+  backend_net:         # API <-> Workers <-> DB <-> Redis <-> MLflow
+  ml_net:              # Worker <-> MLflow <-> Model cache (potentially GPU-heavy)
+
+# ---------------------------------------------------------------------------
+# SERVICES
+# ---------------------------------------------------------------------------
+services:
+
+  # -----------------------------------------------------------------------
+  # 1. DATABASE — PostgreSQL
+  # -----------------------------------------------------------------------
+  # Why: Structured, queryable storage for materials, predictions, candidates,
+  # active learning state, and experiment logs. PostgreSQL specifically because
+  # it supports JSONB columns — useful for storing variable-schema material
+  # properties without a rigid table per property type.
+  #
+  # Key config:
+  #   - POSTGRES_DB/USER/PASSWORD: set via .env file (see .env.example)
+  #   - Volume mount ensures data survives container restarts
+  #   - Only on backend_net — nothing outside the backend layer can reach it
+  #   - healthcheck so dependent services wait until the DB is actually ready
+  # -----------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-catalyst_db}
+      POSTGRES_USER: ${POSTGRES_USER:-catalyst_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql  # Schema on first boot
+    ports:
+      - "5432:5432"  # Expose locally for development/debugging only. Remove in prod.
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-catalyst_user} -d ${POSTGRES_DB:-catalyst_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # -----------------------------------------------------------------------
+  # 2. CACHE / MESSAGE BROKER — Redis
+  # -----------------------------------------------------------------------
+  # Why: Two jobs here. First, it's the message broker for Celery — the API
+  # pushes training jobs and prediction tasks onto queues, and the ML workers
+  # pull from them. Second, it caches frequently-hit prediction results and
+  # candidate rankings so the API doesn't hammer Postgres on every request.
+  #
+  # Key config:
+  #   - appendonly yes: Redis Append Only File ensures data survives crashes.
+  #     Without this, a restart loses all queued jobs.
+  #   - requirepass: set via .env. In prod this should be a strong password.
+  #   - Only on backend_net.
+  # -----------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-changeme}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"  # Expose locally for debugging. Remove in prod.
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # -----------------------------------------------------------------------
+  # 3. MLFLOW TRACKING SERVER
+  # -----------------------------------------------------------------------
+  # Why: Every model training run needs to be tracked — hyperparameters,
+  # metrics, loss curves, and the actual model artifact (weights). MLflow is
+  # the standard open-source tool for this. It gives you a web UI to compare
+  # runs, and a REST API that the workers use to log metrics programmatically.
+  #
+  # Key config:
+  #   - backend-store-uri: SQLite file for run metadata. For production with
+  #     concurrent writes, swap this to the PostgreSQL DB.
+  #   - default-artifact-root: where model weights and plots are stored.
+  #     Mapped to a Docker volume.
+  #   - On ml_net so workers can reach it, and backend_net so the API can
+  #     query run history.
+  #   - Exposes port 5000 locally so you can open the MLflow UI in a browser
+  #     during development.
+  # -----------------------------------------------------------------------
+  mlflow:
+    image: mlflow/mlflow:2.12.1
+    command: mlflow server
+      --backend-store-uri sqlite:////mlflow/db/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+      - mlflow_db:/mlflow/db
+    ports:
+      - "5000:5000"
+    networks:
+      - backend_net
+      - ml_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5000/api/2.0/mlflow/runs/list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -----------------------------------------------------------------------
+  # 4. DATA INGESTION WORKER
+  # -----------------------------------------------------------------------
+  # Why: A dedicated container whose only job is pulling data from external
+  # sources (Materials Project API, OC20 dataset files, AFLOW) and writing
+  # it into Postgres in a normalized, queryable schema.
+  #
+  # Why separate from the ML worker: ingestion is I/O-bound (network calls,
+  # large file downloads). ML training is compute-bound (GPU). They have
+  # completely different resource profiles and failure modes. If ingestion
+  # hangs on a slow API, it shouldn't block a training job.
+  #
+  # Key config:
+  #   - MATERIALS_PROJECT_API_KEY: set via .env. Required to access the MP API.
+  #   - raw_data_cache volume: downloaded files are cached so you don't
+  #     re-download 50GB datasets every time the container restarts.
+  #   - depends_on with healthcheck condition: won't start until Postgres
+  #     is actually ready to accept connections.
+  #   - Runs on a Celery schedule (configured in the app code) — e.g., refresh
+  #     from Materials Project every 24 hours.
+  # -----------------------------------------------------------------------
+  data-ingestion-worker:
+    build:
+      context: ./workers/ingestion
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-catalyst_user}:${POSTGRES_PASSWORD:-changeme}@db:5432/${POSTGRES_DB:-catalyst_db}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0
+      MATERIALS_PROJECT_API_KEY: ${MATERIALS_PROJECT_API_KEY}
+      OC20_DOWNLOAD_URL: ${OC20_DOWNLOAD_URL:-https://opencatalyst.s3.amazonaws.com/oc20/}
+    volumes:
+      - raw_data_cache:/app/cache
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend_net
+    restart: unless-stopped
+
+  # -----------------------------------------------------------------------
+  # 5. ML TRAINING WORKER (GPU)
+  # -----------------------------------------------------------------------
+  # Why: This is the compute-heavy service. It pulls training jobs from the
+  # Redis queue (dispatched by the API), trains GNN models on the ingested
+  # materials data, logs everything to MLflow, and writes predictions back
+  # to Postgres.
+  #
+  # Key config:
+  #   - build context points to a Dockerfile that installs PyTorch with CUDA,
+  #     PyTorch Geometric, and all ML dependencies.
+  #   - deploy.resources.reservations.devices: requests a GPU from the Docker
+  #     runtime. If you're on a machine without a GPU, comment this block out
+  #     and it will fall back to CPU (slower, but functional for testing).
+  #   - MLFLOW_TRACKING_URI: points to the MLflow container so the worker
+  #     can log runs.
+  #   - model_cache volume: pretrained weights (e.g., MACE, SchNet) are
+  #     downloaded once and cached. These can be hundreds of MB.
+  #   - On ml_net for MLflow access and backend_net for DB/Redis access.
+  #
+  # This is the ONLY service that genuinely needs a discrete GPU. Run it on
+  # the R7. Everything else can live on the Ally X.
+  # -----------------------------------------------------------------------
+  ml-training-worker:
+    build:
+      context: ./workers/ml
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-catalyst_user}:${POSTGRES_PASSWORD:-changeme}@db:5432/${POSTGRES_DB:-catalyst_db}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/1
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      HUGGINGFACE_HUB_CACHE: /app/model_cache
+      CUDA_VISIBLE_DEVICES: "0"
+    volumes:
+      - model_cache:/app/model_cache
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    networks:
+      - backend_net
+      - ml_net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # -----------------------------------------------------------------------
+  # 6. PREDICTION & ACTIVE LEARNING WORKER
+  # -----------------------------------------------------------------------
+  # Why: Separated from the training worker intentionally. Training is a
+  # long-running batch job. Prediction and active learning candidate
+  # selection need to be responsive — when the API asks "what are the top
+  # 50 candidates right now?" this worker needs to answer quickly.
+  #
+  # This worker:
+  #   - Loads the best model from MLflow
+  #   - Runs inference across the candidate pool
+  #   - Computes uncertainty estimates (ensemble or MC dropout)
+  #   - Runs Bayesian optimization to select the next batch for validation
+  #   - Writes ranked candidates back to Postgres
+  #
+  # Key config:
+  #   - NO GPU block. This is CPU-bound batch inference — scoring a candidate
+  #     pool takes minutes on CPU, which is fine for this workload. Runs
+  #     comfortably on the Ally X.
+  #   - Shares the model_cache volume with the training worker so it can
+  #     load the same pretrained weights without re-downloading.
+  #   - Uses Redis queue 2 (separate from training queue 1) so training
+  #     jobs don't block prediction jobs.
+  # -----------------------------------------------------------------------
+  prediction-worker:
+    build:
+      context: ./workers/prediction
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-catalyst_user}:${POSTGRES_PASSWORD:-changeme}@db:5432/${POSTGRES_DB:-catalyst_db}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/2
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      HUGGINGFACE_HUB_CACHE: /app/model_cache
+    volumes:
+      - model_cache:/app/model_cache
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    networks:
+      - backend_net
+      - ml_net
+    restart: unless-stopped
+
+  # -----------------------------------------------------------------------
+  # 7. API SERVER — FastAPI
+  # -----------------------------------------------------------------------
+  # Why: The single entry point for the frontend and any external consumers.
+  # It does NOT do heavy computation itself. It:
+  #   - Serves candidate rankings and predictions (from Postgres/Redis cache)
+  #   - Dispatches training and prediction jobs onto the Redis queue
+  #   - Exposes MLflow run history (proxies to MLflow or queries its DB)
+  #   - Handles authentication if needed
+  #
+  # Why FastAPI: async by default, which matters here because most of this
+  # service's work is waiting on DB queries and Redis responses. Pydantic
+  # models give you request/response validation for free. And the auto-
+  # generated OpenAPI docs are genuinely useful during development.
+  #
+  # Key config:
+  #   - Uvicorn with multiple workers for concurrent request handling.
+  #   - On both frontend_net (to talk to the React UI) and backend_net
+  #     (to talk to DB, Redis, and dispatch to workers).
+  #   - Port 8000 exposed to the host.
+  # -----------------------------------------------------------------------
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-catalyst_user}:${POSTGRES_PASSWORD:-changeme}@db:5432/${POSTGRES_DB:-catalyst_db}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      SECRET_KEY: ${API_SECRET_KEY:-changeme}
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - frontend_net
+      - backend_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # -----------------------------------------------------------------------
+  # 8. FRONTEND — React (Nginx-served)
+  # -----------------------------------------------------------------------
+  # Why: The visualization layer. Built with React, Three.js for 3D molecular
+  # rendering, D3.js for interactive dimensionality-reduction plots, and
+  # Recharts for dashboards. Served via Nginx as static files — no Node.js
+  # runtime in production.
+  #
+  # Key config:
+  #   - Multi-stage build: Stage 1 runs `npm run build` to produce static
+  #     files. Stage 2 is a slim Nginx image that just serves them.
+  #   - Nginx config proxies /api/* requests to the FastAPI container. The
+  #     browser never needs to know the API's internal address.
+  #   - Only on frontend_net. Cannot reach the database directly.
+  #   - Port 3000 exposed to the host. In production, put an SSL-terminating
+  #     reverse proxy (like Caddy or an ALB) in front of this.
+  # -----------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    volumes:
+      - ./frontend/nginx.conf:/etc/nginx/conf.d/default.conf
+    ports:
+      - "3000:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - frontend_net
+    restart: unless-stopped
+
+  # -----------------------------------------------------------------------
+  # 9. MONITORING — Prometheus + Grafana (optional but recommended)
+  # -----------------------------------------------------------------------
+  # Why: From day one you want visibility into what's happening. Is the
+  # training job progressing? Is the prediction worker falling behind? Is
+  # the API latency spiking? Prometheus scrapes metrics from all services.
+  # Grafana gives you dashboards.
+  #
+  # This is optional for a first build but I've included it because debugging
+  # a pipeline with 8 services without observability is painful.
+  # -----------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - backend_net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-changeme}
+    volumes:
+      - ./monitoring/grafana-dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana-datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - backend_net
+    restart: unless-stopped

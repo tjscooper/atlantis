@@ -1,0 +1,63 @@
+# =============================================================================
+# prometheus.yml
+# =============================================================================
+# Defines what Prometheus scrapes and how often. Each service in the pipeline
+# exposes a /metrics endpoint (FastAPI via prometheus_fastapi_instrumentator,
+# workers via a custom Prometheus endpoint). Prometheus polls these on the
+# interval defined here and stores the time-series data.
+# =============================================================================
+
+global:
+  scrape_interval: 15s       # How often to pull metrics from each target
+  evaluation_interval: 30s   # How often to evaluate alerting rules
+
+scrape_configs:
+  # ---------------------------------------------------------------------------
+  # FastAPI — request latency, error rates, active connections
+  # ---------------------------------------------------------------------------
+  - job_name: 'api'
+    static_configs:
+      - targets: ['api:8000']
+    metrics_path: /metrics
+
+  # ---------------------------------------------------------------------------
+  # ML Training Worker — GPU utilization, training loss, epochs completed,
+  # queue depth (how many jobs are waiting)
+  # ---------------------------------------------------------------------------
+  - job_name: 'ml-training-worker'
+    static_configs:
+      - targets: ['ml-training-worker:9100']
+    metrics_path: /metrics
+
+  # ---------------------------------------------------------------------------
+  # Prediction Worker — inference latency, candidates scored per minute,
+  # active learning iteration time
+  # ---------------------------------------------------------------------------
+  - job_name: 'prediction-worker'
+    static_configs:
+      - targets: ['prediction-worker:9100']
+    metrics_path: /metrics
+
+  # ---------------------------------------------------------------------------
+  # Data Ingestion Worker — materials ingested per run, API call rate to
+  # Materials Project, errors
+  # ---------------------------------------------------------------------------
+  - job_name: 'data-ingestion-worker'
+    static_configs:
+      - targets: ['data-ingestion-worker:9100']
+    metrics_path: /metrics
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — via postgres_exporter (add as a sidecar if you want DB metrics)
+  # Commented out for now — uncomment if you add a postgres_exporter container.
+  # ---------------------------------------------------------------------------
+  # - job_name: 'postgresql'
+  #   static_configs:
+  #     - targets: ['db-exporter:9187']
+
+  # ---------------------------------------------------------------------------
+  # Redis — via redis_exporter (same deal as above)
+  # ---------------------------------------------------------------------------
+  # - job_name: 'redis'
+  #   static_configs:
+  #     - targets: ['redis-exporter:9121']
